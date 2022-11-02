@@ -54,7 +54,6 @@ module emu
 	output        VGA_F1,
 	output [1:0]  VGA_SL,
 	output        VGA_SCALER, // Force VGA scaler
-	output        VGA_DISABLE, // analog out is off
 
 	input  [11:0] HDMI_WIDTH,
 	input  [11:0] HDMI_HEIGHT,
@@ -111,13 +110,6 @@ module emu
 	//ADC
 	inout   [3:0] ADC_BUS,
 
-	//SD-SPI
-	output        SD_SCK,
-	output        SD_MOSI,
-	input         SD_MISO,
-	output        SD_CS,
-	input         SD_CD,
-
 	//High latency DDR3 RAM interface
 	//Use for non-critical time purposes
 	output        DDRAM_CLK,
@@ -133,30 +125,13 @@ module emu
 
 	//SDRAM interface with lower latency
 	output        SDRAM_CLK,
-	output        SDRAM_CKE,
 	output [12:0] SDRAM_A,
 	output  [1:0] SDRAM_BA,
 	inout  [15:0] SDRAM_DQ,
-	output        SDRAM_DQML,
-	output        SDRAM_DQMH,
 	output        SDRAM_nCS,
 	output        SDRAM_nCAS,
 	output        SDRAM_nRAS,
 	output        SDRAM_nWE,
-
-`ifdef MISTER_DUAL_SDRAM
-	//Secondary SDRAM
-	//Set all output SDRAM_* signals to Z ASAP if SDRAM2_EN is 0
-	input         SDRAM2_EN,
-	output        SDRAM2_CLK,
-	output [12:0] SDRAM2_A,
-	output  [1:0] SDRAM2_BA,
-	inout  [15:0] SDRAM2_DQ,
-	output        SDRAM2_nCS,
-	output        SDRAM2_nCAS,
-	output        SDRAM2_nRAS,
-	output        SDRAM2_nWE,
-`endif
 
 	input         UART_CTS,
 	output        UART_RTS,
@@ -170,11 +145,88 @@ module emu
 	// 1 - D-/TX
 	// 2..6 - USR2..USR6
 	// Set USER_OUT to 1 to read from USER_IN.
-	input   [6:0] USER_IN,
-	output  [6:0] USER_OUT,
+	output        USER_OSD,
+	output  [1:0] USER_MODE,
+	input   [7:0] USER_IN,
+	output  [7:0] USER_OUT,
+	input   [7:0] USER_IN2,
+	output  [7:0] USER_OUT2,
 
 	input         OSD_STATUS
 );
+
+wire         CLK_JOY = CLK_50M & mt32_disable;         //Assign clock between 40-50Mhz
+wire   [2:0] JOY_FLAG = mt32_disable ? {db9md_ena,~db9md_ena,1'b0} : 3'b000;   //Assign 3 bits of status (31:29) o (63:61)
+wire         JOY_CLK, JOY_LOAD, JOY_SPLIT, JOY_MDSEL;
+wire   [5:0] JOY_MDIN  = JOY_FLAG[2] ? {USER_IN[6],USER_IN[3],USER_IN[5],USER_IN[7],USER_IN[1],USER_IN[2]} : '1;
+wire         JOY_DATA  = JOY_FLAG[1] ? USER_IN[5] : '1;
+//assign       USER_OUT  = JOY_FLAG[2] ? {3'b111,JOY_SPLIT,3'b111,JOY_MDSEL} : JOY_FLAG[1] ? {6'b111011,JOY_CLK,JOY_LOAD} : '1;
+assign       USER_MODE = JOY_FLAG[2:1] ;
+assign       USER_OSD  = JOY_DB1[10] & JOY_DB1[6];
+`ifdef SECOND_MT32
+assign       USER_OUT2[6:0] = USER_OUT_MT32;
+`endif
+
+reg  db9md_ena=1'b0;
+reg  db9_1p_ena=1'b0,db9_2p_ena=1'b0;
+wire db9_status = db9md_ena ? 1'b1 : USER_IN[7];
+always @(posedge clk_32) 
+ begin
+	if(~db9md_ena & ~db9_status) db9md_ena <= 1'b1; 
+   if(JOYDB9MD_1[2] || JOYDB15_1[2]) db9_1p_ena <= 1'b1;
+	if(~JOYDB9MD_1[2] && JOYDB9MD_2[2] || JOYDB15_2[2]) db9_2p_ena <= 1'b1; //Se niega el del player 1 por si no hay Splitter que no se duplique
+ end
+
+wire [15:0] JOY_DB1 = db9md_ena ? JOYDB9MD_1 : JOYDB15_1;
+wire [15:0] JOY_DB2 = db9md_ena ? JOYDB9MD_2 : JOYDB15_2;
+
+reg [15:0] JOYDB9MD_1,JOYDB9MD_2;
+joy_db9md joy_db9md
+(
+  .clk       ( CLK_JOY    ), //40-50MHz
+  .joy_split ( JOY_SPLIT  ),
+  .joy_mdsel ( JOY_MDSEL  ),
+  .joy_in    ( JOY_MDIN   ),
+  .joystick1 ( JOYDB9MD_1 ),
+  .joystick2 ( JOYDB9MD_2 )	  
+);
+
+reg [15:0] JOYDB15_1,JOYDB15_2;
+joy_db15 joy_db15
+(
+  .clk       ( CLK_JOY   ), //48MHz
+  .JOY_CLK   ( JOY_CLK   ),
+  .JOY_DATA  ( JOY_DATA  ),
+  .JOY_LOAD  ( JOY_LOAD  ),
+  .joystick1 ( JOYDB15_1 ),
+  .joystick2 ( JOYDB15_2 )	  
+);
+
+always_comb begin
+	USER_OUT    = 8'hFF; 
+`ifndef SECOND_MT32
+	if( ~mt32_disable )begin
+		USER_OUT[6:0] = USER_OUT_MT32;
+	end else if (JOY_FLAG[1]) begin
+`else
+	if (JOY_FLAG[1]) begin
+`endif
+		USER_OUT[0] = JOY_LOAD;
+		USER_OUT[1] = JOY_CLK;
+		USER_OUT[6] = 1'b1;
+		USER_OUT[4] = 1'b1;
+	end else if (JOY_FLAG[2]) begin
+		USER_OUT[0] = JOY_MDSEL;
+		USER_OUT[1] = 1'b1;
+		USER_OUT[6] = 1'b1;
+		USER_OUT[4] = JOY_SPLIT;
+	end
+end
+
+wire [15:0] joy0 = db9_1p_ena ? JOY_DB1 : joy0_usb;
+wire [15:0] joy1 = db9_2p_ena ? JOY_DB2 : db9_1p_ena ? joy0_usb : joy1_usb;
+wire [15:0] joy2 = db9_2p_ena ? joy0_usb : db9_1p_ena ? joy1_usb : joy2_usb;
+wire [15:0] joy3 = db9_2p_ena ? joy1_usb : db9_1p_ena ? joy2_usb : joy3_usb;
 
 assign ADC_BUS  = 'Z;
 
@@ -188,12 +240,10 @@ assign LED_USER  = ~&floppy_sel;
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
 assign BUTTONS   = 0;
-assign VGA_SCALER  = 0;
-assign VGA_DISABLE = 0;
+assign VGA_SCALER= 0;
 assign HDMI_FREEZE = 0;
 
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
-assign {SD_SCK, SD_MOSI, SD_CS} = 'Z;
 
 wire       vcrop_en = status[42];
 reg        en216p;
@@ -275,7 +325,7 @@ wire [15:0] ioctl_dout;
 wire        ioctl_wr;
 wire  [7:0] ioctl_index;
 
-wire [20:0] joy0,joy1,joy2,joy3;
+wire [20:0] joy0_usb,joy1_usb,joy2_usb,joy3_usb;
 wire [10:0] ps2_key;
 wire [24:0] ps2_mouse;
 wire  [7:0] ps2_mouse_ext;
@@ -295,16 +345,17 @@ hps_io #(.CONF_STR(CONF_STR), .WIDE(1), .VDNUM(2)) hps_io
 	.gamma_bus(gamma_bus),
 	.new_vmode(mde60),
 
-	.joystick_0(joy0),
-	.joystick_1(joy1),
-	.joystick_2(joy2),
-	.joystick_3(joy3),
+	.joy_raw(JOY_DB1[5:0] | JOY_DB2[5:0]),
+	.joystick_0(joy0_usb),
+	.joystick_1(joy1_usb),
+	.joystick_2(joy2_usb),
+	.joystick_3(joy3_usb),
 	.ps2_key(ps2_key),
 	.ps2_mouse(ps2_mouse),
 	.ps2_mouse_ext(ps2_mouse_ext),
 
 	.status(status),
-	.status_menumask({mt32_cfg,mt32_available}),
+	.status_menumask({mt32_cfg,1'b1}), //mt32_available 
 	.info_req(info_req),
 	.info(info),
 
@@ -400,23 +451,19 @@ wire [11:0] vend[8]   = '{ 261, 311, 437, 0,  252, 293, 522, 0};
 
 reg       hblank_gen, vblank_gen;
 reg [2:0] mode;
-reg       vsync_n_l, hsync_n_l;
 always @(posedge clk_32) begin
+	reg old_vs, old_hs;
 	reg  [11:0] hcnt,vcnt;
 	
 	hcnt <= hcnt + 1'd1;
-	hsync_n_l <= hsync_n;
-
-	if(~hsync_n_l & hsync_n) begin
+	old_hs <= hsync_n;
+	if(~old_hs & hsync_n) begin
 		hcnt <= 0;
 		vcnt <= vcnt + 1'd1;
 	end
 
-	if (hsync_n_l & ~hsync_n) begin
-		vsync_n_l <= vsync_n;
-	end
-
-	if(vsync_n_l & ~vsync_n) begin
+	old_vs <= vsync_n;
+	if(old_vs & ~vsync_n) begin
 		mode <= {mono ? mde60 : narrow_brd, mono, ~mono & pal};
 		vcnt <= 0;
 	end
@@ -438,8 +485,8 @@ linedoubler linedoubler
 	.clk_sys(clk_32),
 	.enable(sd_ena),
 
-	.hs_in(~hsync_n_l),
-	.vs_in(~vsync_n_l),
+	.hs_in(~hsync_n),
+	.vs_in(~vsync_n),
 	.hbl_in(hblank_gen),
 	.vbl_in(vblank_gen),
 	.r_in(r),
@@ -586,9 +633,17 @@ wire mt32_available;
 wire mt32_use  = mt32_available & ~mt32_disable;
 wire mt32_mute = mt32_available &  mt32_disable;
 
+`ifndef SECOND_MT32
+wire [6:0] USER_IN_MT32 = mt32_disable ? 1 : USER_IN[6:0];
+`else
+wire [6:0] USER_IN_MT32 = mt32_disable ? 1 : USER_IN2[6:0];
+`endif
+wire [6:0] USER_OUT_MT32;
 mt32pi mt32pi
 (
 	.*,
+	.USER_IN(USER_IN_MT32),
+	.USER_OUT(USER_OUT_MT32),
 	.reset(mt32_reset),
 	.CE_PIXEL(mt32_ce_pix),
 	.midi_tx(midi_tx | mt32_mute)
@@ -655,26 +710,25 @@ end
 //////////////////////////////////////////////////////////////////////////////////
 
 // enable additional ste/megaste features
-wire       MEM512K       = (status[3:1] == 3'd0);
-wire       MEM1M         = (status[3:1] == 3'd1);
-wire       MEM2M         = (status[3:1] == 3'd2);
-wire       MEM4M         = (status[3:1] == 3'd3);
-wire       MEM8M         = (status[3:1] == 3'd4);
-wire       MEM14M        = (status[3:1] == 3'd5);
-wire [1:0] fdc_wp        = status[7:6];
-wire       mono_monitor  = status[8];
-wire [8:0] acsi_enable   = status[17:10];
-wire       blitter_en    = (status[19] || ste);
-wire [1:0] scanlines     = status[21:20];
-wire       psg_stereo    = status[22];
-wire       ste           = status[23] || status[24];
-wire       mste          = status[24];
-wire       steroids      = status[23] && status[24];  // a STE on steroids
-wire       cubase_enable = status[25];
-wire       viking_en     = status[28];
-wire       narrow_brd    = status[29];
-wire       mde60         = status[30];
-wire [1:0] ar            = {status[31],status[9]};
+wire       MEM512K      = (status[3:1] == 3'd0);
+wire       MEM1M        = (status[3:1] == 3'd1);
+wire       MEM2M        = (status[3:1] == 3'd2);
+wire       MEM4M        = (status[3:1] == 3'd3);
+wire       MEM8M        = (status[3:1] == 3'd4);
+wire       MEM14M       = (status[3:1] == 3'd5);
+wire [1:0] fdc_wp       = status[7:6];
+wire       mono_monitor = status[8];
+wire [8:0] acsi_enable  = status[17:10];
+wire       blitter_en   = (status[19] || ste);
+wire [1:0] scanlines    = status[21:20];
+wire       psg_stereo   = status[22];
+wire       ste          = status[23] || status[24];
+wire       mste         = status[24];
+wire       steroids     = status[23] && status[24];  // a STE on steroids
+wire       viking_en    = status[28];
+wire       narrow_brd   = status[29];
+wire       mde60        = status[30];
+wire [1:0] ar           = {status[31],status[9]};
 
 // synchronized reset signal
 reg reset;
@@ -738,7 +792,6 @@ assign      cpu_din =
               blitter_sel ? blitter_data_out :
               !rdat_n  ? shifter_dout :
               !(mfpcs_n & mfpiack_n)? { 8'hff, mfp_data_out } :
-              (!rom3_n & cubase_enable) ? {cubase_dout, 8'hff} :
               !rom_n   ? rom_data_out :
               n6850    ? { mbus_a[2] ? midi_acia_data_out : kbd_acia_data_out, 8'hFF } :
               sndcs    ? { snd_data_out, 8'hFF }:
@@ -1410,42 +1463,6 @@ fdc1772 #(.IMG_TYPE(1)) fdc1772 (
 );
 
 /* ------------------------------------------------------------------------------ */
-/* ------------------------------- Cubase dongle  ------------------------------- */
-/* ------------------------------------------------------------------------------ */
-wire        cubase3_d8;
-wire  [7:0] cubase2_dout;
-wire  [7:0] cubase_dout = cubase_sel ? cubase2_dout : {7'h7f, cubase3_d8};
-reg         cubase_sel; // Cubase3/2 dongle
-reg         cubase_lock;
-
-always @(posedge clk_32) begin
-	if (peripheral_reset) begin
-		cubase_sel <= 0;
-		cubase_lock <= 0;
-	end
-	else if (cubase_enable & !rom3_n & !cubase_lock) begin
-		cubase_sel <= |mbus_a[7:1];
-		cubase_lock <= 1;
-	end
-end
-
-cubase2_dongle cubase2_dongle (
-	.clk        ( clk_32           ),
-	.reset      ( peripheral_reset ),
-	.uds_n      ( uds_n            ),
-	.A          ( mbus_a[8:1]      ),
-	.D          ( cubase2_dout     )
-);
-
-cubase3_dongle cubase3_dongle (
-	.clk        ( clk_32           ),
-	.reset      ( peripheral_reset ),
-	.rom3_n     ( rom3_n           ),
-	.a8         ( mbus_a[8]        ),
-	.d8         ( cubase3_d8       )
-);
-
-/* ------------------------------------------------------------------------------ */
 /* --------------------------- SDRAM bus multiplexer ---------------------------- */
 /* ------------------------------------------------------------------------------ */
 
@@ -1504,21 +1521,16 @@ wire sdram_uds = (cpu_cycle & dio_download)?1'b1:ram_uds;
 wire sdram_lds = (cpu_cycle & dio_download)?1'b1:ram_lds;
 
 wire [23:1] rom_a = (!rom2_n & ~tos192k) ? { 4'hE, 2'b00, mbus_a[17:1] } :
-                    (!rom2_n &  tos192k) ? { 4'hF, 2'b11, mbus_a[17:1] } : 
-                    !rom4_n              ? { 8'hFA,       mbus_a[15:1] } : 
-                    !rom3_n              ? { 8'hFB,       mbus_a[15:1] } : mbus_a;
+                    (!rom2_n &  tos192k) ? { 4'hF, 2'b11, mbus_a[17:1] } : mbus_a;
 
 wire [15:0] ram_data_out;
 wire [63:0] ram_data_out64;
 wire [15:0] rom_data_out;
 
-assign SDRAM_CKE = 1'b1;
-
 sdram sdram (
 	// interface to the MT48LC16M16 chip
 	.sd_data     	( SDRAM_DQ                 ),
 	.sd_addr     	( SDRAM_A                  ),
-	.sd_dqm      	( {SDRAM_DQMH, SDRAM_DQML} ),
 	.sd_cs       	( SDRAM_nCS                ),
 	.sd_ba       	( SDRAM_BA                 ),
 	.sd_we       	( SDRAM_nWE                ),
