@@ -54,6 +54,7 @@ module emu
 	output        VGA_F1,
 	output [1:0]  VGA_SL,
 	output        VGA_SCALER, // Force VGA scaler
+	output        VGA_DISABLE, // analog out is off
 
 	input  [11:0] HDMI_WIDTH,
 	input  [11:0] HDMI_HEIGHT,
@@ -240,7 +241,8 @@ assign LED_USER  = ~&floppy_sel;
 assign LED_DISK  = 0;
 assign LED_POWER = 0;
 assign BUTTONS   = 0;
-assign VGA_SCALER= 0;
+assign VGA_SCALER  = 0;
+assign VGA_DISABLE = 0;
 assign HDMI_FREEZE = 0;
 
 assign {DDRAM_CLK, DDRAM_BURSTCNT, DDRAM_ADDR, DDRAM_DIN, DDRAM_BE, DDRAM_RD, DDRAM_WE} = 0;
@@ -451,19 +453,23 @@ wire [11:0] vend[8]   = '{ 261, 311, 437, 0,  252, 293, 522, 0};
 
 reg       hblank_gen, vblank_gen;
 reg [2:0] mode;
+reg       vsync_n_l, hsync_n_l;
 always @(posedge clk_32) begin
-	reg old_vs, old_hs;
 	reg  [11:0] hcnt,vcnt;
 	
 	hcnt <= hcnt + 1'd1;
-	old_hs <= hsync_n;
-	if(~old_hs & hsync_n) begin
+	hsync_n_l <= hsync_n;
+
+	if(~hsync_n_l & hsync_n) begin
 		hcnt <= 0;
 		vcnt <= vcnt + 1'd1;
 	end
 
-	old_vs <= vsync_n;
-	if(old_vs & ~vsync_n) begin
+	if (hsync_n_l & ~hsync_n) begin
+		vsync_n_l <= vsync_n;
+	end
+
+	if(vsync_n_l & ~vsync_n) begin
 		mode <= {mono ? mde60 : narrow_brd, mono, ~mono & pal};
 		vcnt <= 0;
 	end
@@ -485,8 +491,8 @@ linedoubler linedoubler
 	.clk_sys(clk_32),
 	.enable(sd_ena),
 
-	.hs_in(~hsync_n),
-	.vs_in(~vsync_n),
+	.hs_in(~hsync_n_l),
+	.vs_in(~vsync_n_l),
 	.hbl_in(hblank_gen),
 	.vbl_in(vblank_gen),
 	.r_in(r),
@@ -710,25 +716,26 @@ end
 //////////////////////////////////////////////////////////////////////////////////
 
 // enable additional ste/megaste features
-wire       MEM512K      = (status[3:1] == 3'd0);
-wire       MEM1M        = (status[3:1] == 3'd1);
-wire       MEM2M        = (status[3:1] == 3'd2);
-wire       MEM4M        = (status[3:1] == 3'd3);
-wire       MEM8M        = (status[3:1] == 3'd4);
-wire       MEM14M       = (status[3:1] == 3'd5);
-wire [1:0] fdc_wp       = status[7:6];
-wire       mono_monitor = status[8];
-wire [8:0] acsi_enable  = status[17:10];
-wire       blitter_en   = (status[19] || ste);
-wire [1:0] scanlines    = status[21:20];
-wire       psg_stereo   = status[22];
-wire       ste          = status[23] || status[24];
-wire       mste         = status[24];
-wire       steroids     = status[23] && status[24];  // a STE on steroids
-wire       viking_en    = status[28];
-wire       narrow_brd   = status[29];
-wire       mde60        = status[30];
-wire [1:0] ar           = {status[31],status[9]};
+wire       MEM512K       = (status[3:1] == 3'd0);
+wire       MEM1M         = (status[3:1] == 3'd1);
+wire       MEM2M         = (status[3:1] == 3'd2);
+wire       MEM4M         = (status[3:1] == 3'd3);
+wire       MEM8M         = (status[3:1] == 3'd4);
+wire       MEM14M        = (status[3:1] == 3'd5);
+wire [1:0] fdc_wp        = status[7:6];
+wire       mono_monitor  = status[8];
+wire [8:0] acsi_enable   = status[17:10];
+wire       blitter_en    = (status[19] || ste);
+wire [1:0] scanlines     = status[21:20];
+wire       psg_stereo    = status[22];
+wire       ste           = status[23] || status[24];
+wire       mste          = status[24];
+wire       steroids      = status[23] && status[24];  // a STE on steroids
+wire       cubase_enable = status[25];
+wire       viking_en     = status[28];
+wire       narrow_brd    = status[29];
+wire       mde60         = status[30];
+wire [1:0] ar            = {status[31],status[9]};
 
 // synchronized reset signal
 reg reset;
@@ -792,6 +799,7 @@ assign      cpu_din =
               blitter_sel ? blitter_data_out :
               !rdat_n  ? shifter_dout :
               !(mfpcs_n & mfpiack_n)? { 8'hff, mfp_data_out } :
+			  (!rom3_n & cubase_enable) ? {cubase_dout, 8'hff} :
               !rom_n   ? rom_data_out :
               n6850    ? { mbus_a[2] ? midi_acia_data_out : kbd_acia_data_out, 8'hFF } :
               sndcs    ? { snd_data_out, 8'hFF }:
@@ -1463,6 +1471,42 @@ fdc1772 #(.IMG_TYPE(1)) fdc1772 (
 );
 
 /* ------------------------------------------------------------------------------ */
+/* ------------------------------- Cubase dongle  ------------------------------- */
+/* ------------------------------------------------------------------------------ */
+wire        cubase3_d8;
+wire  [7:0] cubase2_dout;
+wire  [7:0] cubase_dout = cubase_sel ? cubase2_dout : {7'h7f, cubase3_d8};
+reg         cubase_sel; // Cubase3/2 dongle
+reg         cubase_lock;
+
+always @(posedge clk_32) begin
+	if (peripheral_reset) begin
+		cubase_sel <= 0;
+		cubase_lock <= 0;
+	end
+	else if (cubase_enable & !rom3_n & !cubase_lock) begin
+		cubase_sel <= |mbus_a[7:1];
+		cubase_lock <= 1;
+	end
+end
+
+cubase2_dongle cubase2_dongle (
+	.clk        ( clk_32           ),
+	.reset      ( peripheral_reset ),
+	.uds_n      ( uds_n            ),
+	.A          ( mbus_a[8:1]      ),
+	.D          ( cubase2_dout     )
+);
+
+cubase3_dongle cubase3_dongle (
+	.clk        ( clk_32           ),
+	.reset      ( peripheral_reset ),
+	.rom3_n     ( rom3_n           ),
+	.a8         ( mbus_a[8]        ),
+	.d8         ( cubase3_d8       )
+);
+
+/* ------------------------------------------------------------------------------ */
 /* --------------------------- SDRAM bus multiplexer ---------------------------- */
 /* ------------------------------------------------------------------------------ */
 
@@ -1521,7 +1565,9 @@ wire sdram_uds = (cpu_cycle & dio_download)?1'b1:ram_uds;
 wire sdram_lds = (cpu_cycle & dio_download)?1'b1:ram_lds;
 
 wire [23:1] rom_a = (!rom2_n & ~tos192k) ? { 4'hE, 2'b00, mbus_a[17:1] } :
-                    (!rom2_n &  tos192k) ? { 4'hF, 2'b11, mbus_a[17:1] } : mbus_a;
+                    (!rom2_n &  tos192k) ? { 4'hF, 2'b11, mbus_a[17:1] } : 
+                    !rom4_n              ? { 8'hFA,       mbus_a[15:1] } : 
+                    !rom3_n              ? { 8'hFB,       mbus_a[15:1] } : mbus_a;
 
 wire [15:0] ram_data_out;
 wire [63:0] ram_data_out64;
